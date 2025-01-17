@@ -67,17 +67,14 @@ if __name__ == "__main__":
 
     now = datetime.now()
 
-    active_wallets_file = "assets/outcome/active_wallets_20250114_1918_1h.csv"
-    wallets = ['0x1638095947833f43a732e0da2ca9c3548887339b']
-    wallets_df = pd.read_csv(active_wallets_file)
+    target_wallets_file = ""
+    wallets_df = pd.read_csv(target_wallets_file)
     
     # Process each wallet address
-    # for wallet in wallets_df['wallet']:
-    for wallet in wallets:
+    for wallet in wallets_df['wallet']:
         counter += 1
         print(f"\nProcessing wallet: {wallet} || ({counter}/{len(wallets_df)})")
-        # output_file = f"assets/outcome/backtest/{wallet}.csv"
-        output_file = f"assets/outcome/{wallet}.csv"
+        output_file = f"assets/outcome/backtest/{wallet}.csv"
         try:
             get_polymarket_transactions(wallet, output_file)
         except Exception as e:
