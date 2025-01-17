@@ -12,8 +12,8 @@ A Python-based trading bot that follows and replicates trades from specified wal
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/polymarket-ct.git
-cd polymarket-ct
+git clone https://github.com/yourusername/polymarket-copy-trade.git
+cd polymarket-copy-trade
 ```
 
 2. Install dependencies:
@@ -58,3 +58,7 @@ The `src/test` directory contains individual test files for specific functionali
 ## ⚠️ Disclaimer
 
 This bot is for educational purposes only. Use at your own risk. Trading cryptocurrency carries significant risks. 
+
+## TODO
+ - effectively searching for smart wallet and build pools
+ - periodically backtesting 
