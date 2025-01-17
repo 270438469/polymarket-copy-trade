@@ -1,0 +1,3 @@
+"""
+Polymarket Trade Follower package.
+""" 
