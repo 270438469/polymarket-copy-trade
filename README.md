@@ -59,6 +59,9 @@ The `src/test` directory contains individual test files for specific functionali
 
 This bot is for educational purposes only. Use at your own risk. Trading cryptocurrency carries significant risks. 
 
-## TODO
+## 💬 Contact
+TG: @bitsong999
+
+## 📝 TODO
  - effectively searching for smart wallet and build pools
  - periodically backtesting 
