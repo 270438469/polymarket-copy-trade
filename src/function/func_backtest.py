@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from _py_clob_client.client import ClobClient
 from utils.utils import get_position_all
+from datetime import datetime, timedelta
 
 
 class WalletBacktest:
@@ -25,8 +26,11 @@ class WalletBacktest:
     }
 
     # USDC transfer event signature
-    TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-    USDC_SENDER = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+    TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".lower()
+    USDC_SENDER = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".lower()
+
+    # Add after USDC_SENDER constant
+    TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62".lower()
 
     def __init__(self, api_key: str, clob_client: ClobClient, max_workers: int = 5):
         """
@@ -124,6 +128,10 @@ class WalletBacktest:
         Decode transaction input data using Web3
         """
         try:
+            # Check if input data matches the match_orders_signature
+            if not input_data.startswith(self.match_orders_signature):
+                return None
+            
             # Create contract instance
             contract = self.w3.eth.contract(abi=self.contract_abis[contract_name])
             
@@ -133,13 +141,11 @@ class WalletBacktest:
             # Extract function name and parameters
             func_name = decoded[0].fn_name
             params = decoded[1]
-            
             return {
                 'function_name': func_name,
                 'parameters': params
             }
         except Exception as e:
-            print(f"Error decoding input data: {e}")
             return None
 
     def _process_transfer(self, transfer: Dict, pbar: tqdm) -> Dict:
@@ -155,17 +161,27 @@ class WalletBacktest:
                 transfer['interacted_with'] = tx_data.get('to', '')
         else:
             transfer['interacted_with'] = self.POLYMARKET_CONTRACTS['RELAY_HUB']
+            transfer['function_name'] = 'relayCall'
         pbar.update(1)
         return transfer
 
-    def download_transactions(self, address: str) -> list:
+    def download_transactions(self, address: str, days: int = None) -> list:
         """
         Download all ERC-20 token transfers and their corresponding transaction data
         
         Args:
             address: The address to get token transfers for
+            days: Number of days to look back from current time (None means all history)
         """
         base_url = "https://api.polygonscan.com/api"
+        
+        # Calculate start timestamp if days is provided
+        if days is not None:
+            current_time = datetime.now()
+            start_date = current_time - timedelta(days=days)
+            # Set to start of the day (midnight)
+            start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_timestamp = int(start_date.timestamp())
         
         params = {
             'module': 'account',
@@ -194,6 +210,13 @@ class WalletBacktest:
                     tx for tx in data['result'] 
                     if tx['from'].lower() in polymarket_addresses or tx['to'].lower() in polymarket_addresses
                 ]
+                
+                # Filter by timestamp if days is provided
+                if days is not None:
+                    transfers = [
+                        tx for tx in transfers 
+                        if int(tx['timeStamp']) >= start_timestamp
+                    ]
                 
                 # Use ThreadPoolExecutor for parallel processing
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -290,65 +313,109 @@ class WalletBacktest:
         return stats_df
 
     def decode_transaction_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Decode transaction input data for all transactions in DataFrame
-        """
-        decoded_data = []
-        for _, row in df.iterrows():
-            to_address = row['interacted_with'].lower() if row['interacted_with'] else ''
-            contract_name = None
-            if to_address == self.POLYMARKET_CONTRACTS['RELAY_HUB']:
-                continue
+        """Decode transaction input data with parallel processing"""
+        # Initialize columns with default values
+        df['maker'] = ''
+        df['signer'] = ''
+        df['tokenId'] = ''
+        df['makerAmount'] = ''
+        df['side'] = 1  # Default side value is 1
+        df['signatureType'] = ''
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Create futures for decoding each transaction
+            futures = []
+            for idx, row in df.iterrows():
+                future = executor.submit(self._decode_single_transaction, row)
+                futures.append((idx, future))
             
-            # Find which Polymarket contract this transaction is for
-            for name, addr in self.POLYMARKET_CONTRACTS.items():
-                if addr == to_address:
-                    contract_name = name
-                    break
-            
-            if contract_name and row.get('input'):
-                try:
-                    # Remove '0x' prefix if present for consistent handling
-                    input_data = row['input']
-                    if input_data.startswith('0x'):
-                        input_data = input_data[2:]
-                    
-                    # Get contract instance
-                    contract = self.w3.eth.contract(abi=self.contract_abis[contract_name])
-                    
-                    # Get function signature (first 4 bytes / 8 characters of input)
-                    func_signature = '0x' + input_data[:8]
-                    
-                    # Check if this is the specific function signature we're looking for
-                    if func_signature.startswith(self.match_orders_signature):  # matchOrders methodID 0xd2539b37
-                        try:
-                            # Decode input data
-                            decoded = contract.decode_function_input('0x' + input_data)
-                            decoded_data.append({
-                                'maker': decoded[1]['takerOrder'].get('maker', ''),
-                                'signer': decoded[1]['takerOrder'].get('signer', ''),
-                                'tokenId': decoded[1]['takerOrder'].get('tokenId', ''),
-                                'makerAmount': decoded[1]['takerOrder'].get('makerAmount', ''),
-                                'side': decoded[1]['takerOrder'].get('side', ''),
-                                'signatureType': decoded[1]['takerOrder'].get('signatureType', ''),
-                                'function_name': 'matchOrders'
-                            })
-                        except Exception as e:
-                            print(f"Failed to decode input for tx {row['hash']}: {e}")
-                            decoded_data.append({})
-                    else:
-                        print(f"Skipping non-target function signature: {func_signature}")
-                        decoded_data.append({})
-                        
-                except Exception as e:
-                    print(f"Failed to decode input for tx {row['hash']}: {e}")
-                    decoded_data.append({})
-            else:
-                decoded_data.append({})
+            # Update DataFrame with decoded results
+            for idx, future in tqdm(futures, desc="Decoding transactions"):
+                decoded_data = future.result()
+                for key, value in decoded_data.items():
+                    df.at[idx, key] = value
+
+        return df
+
+    def _decode_single_transaction(self, row: pd.Series) -> Dict:
+        """Decode a single transaction's input data"""
+        decoded_data = {}
+        try:
+            if pd.notna(row['input']):
+                input_data = row['input']
+                if input_data.startswith('0xd2539b37'):
+                    # 使用CTF_EXCHANGE合约的ABI来解码
+                    decoded = self.decode_input_data_web3('FEE_MODULE', input_data)
+                    if decoded:
+                        # 从parameters中获取参数
+                        params = decoded.get('parameters', {})
+                        decoded_data.update({
+                            'maker': params['takerOrder'].get('maker', ''),
+                            'signer': params['takerOrder'].get('signer', ''),
+                            'tokenId': params['takerOrder'].get('tokenId', ''),
+                            'makerAmount': params['takerOrder'].get('makerAmount', ''),
+                            'side': params['takerOrder'].get('side', 1),
+                            'signatureType': params['takerOrder'].get('signatureType', ''),
+                            'function_name': decoded.get('function_name', '')
+                        })
+        except Exception as e:
+            print(f"Error decoding transaction: {e}")
         
-        # Add decoded data to DataFrame
-        decoded_df = pd.DataFrame(decoded_data)
-        return pd.concat([df, decoded_df], axis=1)
+        return decoded_data
+
+    def calculate_price(self, row: pd.Series, address: str) -> float:
+        """
+        Calculate price based on side and transaction data
+        
+        Args:
+            row: DataFrame row containing transaction data
+            address: Target address for log filtering
+        
+        Returns:
+            float: Calculated price
+        """
+        # If side is empty, return 1
+        if pd.isna(row['side']) or row['side'] == '':
+            return 1.0
+            
+        # Convert side to int for comparison
+        side = int(row['side'])
+        
+        # For SELL orders
+        if side == 1:
+            # If tokenId is empty for SELL orders, return 1
+            if pd.isna(row['tokenId']) or row['tokenId'] == '':
+                return 1.0
+                
+            # Normal SELL order price calculation
+            if float(row['makerAmount']) == 0:
+                return 1.0
+            return float(row['value']) / (float(row['makerAmount']) / 1e6)
+            
+        # For BUY orders
+        if side == 0:
+            try:
+                # Get transaction receipt
+                receipt = self.w3.eth.get_transaction_receipt(row['hash'])
+                
+                # Find the relevant log
+                for log in receipt['logs']:
+                    # Check if this is a TransferSingle event and to the target address
+                    if (("0x" + log['topics'][0].hex()).lower() == self.TRANSFER_SINGLE_TOPIC and
+                        "0x" + log['topics'][-1].hex()[-40:].lower() == address.lower()):
+                        # Get value from log data
+                        value = int(log['data'].hex()[-64:], 16)  # Last 32 bytes contain the value
+                        if value == 0:
+                            return 1.0
+                        return float(row['makerAmount']) / value
+                
+                # If no matching log found, return 1
+                return 1.0
+                
+            except Exception as e:
+                print(f"Error calculating BUY price for tx {row['hash']}: {e}")
+                return 1.0
+        return 1.0
 
     def process_transactions(self, transactions: list, address: str) -> pd.DataFrame:
         """
@@ -358,24 +425,21 @@ class WalletBacktest:
             transactions: List of transactions to process
             address: Address to calculate statistics for
         """
-        # Convert to DataFrame
         df = pd.DataFrame(transactions)
-
-        # Convert timestamp to datetime
         df['timeStamp'] = pd.to_datetime(df['timeStamp'].astype(int), unit='s')
         
         # Convert token value from wei to USDC (6 decimals)
         df['value'] = df['value'].astype(float) / 1e6
-        
-        # Convert gas price from wei to Gwei
+
         df['gasPrice'] = df['gasPrice'].astype(float) / 1e9
-        
-        # Calculate gas cost in MATIC
         df['gasCost'] = (df['gasPrice'] * df['gasUsed'].astype(float)) / 1e9
         
         # Decode transaction data
         df = self.decode_transaction_data(df)
         
+        # Calculate price for each transaction
+        df['price'] = df.apply(lambda row: self.calculate_price(row, address), axis=1)
+
         # Get current positions
         positions = self.get_current_positions(address)
         
@@ -395,6 +459,9 @@ class WalletBacktest:
             axis=1
         )
         
+        # delete empty function_name rows
+        df = df.dropna(subset=['function_name'])
+
         # Calculate P&L statistics
         pnl_stats = self.calculate_pnl_stats(df)
         
